@@ -44,7 +44,7 @@ from copy import deepcopy
 from pathlib import Path
 import torch
 from torch import nn
-
+import torch.nn.functional as F
 
 def MLP(channels: list, do_bn=True):
     """ Multi-layer perceptron """
@@ -141,37 +141,61 @@ class AttentionalGNN(nn.Module):
         return desc0, desc1
 
 
-def log_sinkhorn_iterations(Z, log_mu, log_nu, iters: int):
-    """ Perform Sinkhorn Normalization in Log-space for stability"""
-    u, v = torch.zeros_like(log_mu), torch.zeros_like(log_nu)
-    for _ in range(iters):
-        u = log_mu - torch.logsumexp(Z + v.unsqueeze(1), dim=2)
-        v = log_nu - torch.logsumexp(Z + u.unsqueeze(2), dim=1)
-    return Z + u.unsqueeze(2) + v.unsqueeze(1)
+def sigmoid_log_double_softmax(
+    sim: torch.Tensor, z0: torch.Tensor, z1: torch.Tensor
+) -> torch.Tensor:
+    """create the log assignment matrix from logits and similarity"""
+    b, m, n = sim.shape
+    oa = F.logsigmoid(z0)
+    ob = F.logsigmoid(z1)
+    certainties = oa + ob.transpose(1, 2)
+    scores0 = F.log_softmax(sim, 2)
+    scores1 = F.log_softmax(sim.transpose(-1, -2).contiguous(), 2).transpose(-1, -2)
+    scores = sim.new_full((b, m + 1, n + 1), 0)
+    scores[:, :m, :n] = scores0 + scores1 + certainties
+    scores[:, :-1, -1] = F.logsigmoid(-z0.squeeze(-1))
+    scores[:, -1, :-1] = F.logsigmoid(-z1.squeeze(-1))
+    return scores, oa, ob
 
 
-def log_optimal_transport(scores, alpha, iters: int):
-    """ Perform Differentiable Optimal Transport in Log-space for stability"""
-    b, m, n = scores.shape
-    one = scores.new_tensor(1)
-    ms, ns = (m*one).to(scores), (n*one).to(scores)
+class MatchAssignment(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+        self.matchability = nn.Linear(dim, 1, bias=True)
+        self.final_proj = nn.Linear(dim, dim, bias=True)
 
-    bins0 = alpha.expand(b, m, 1)
-    bins1 = alpha.expand(b, 1, n)
-    alpha = alpha.expand(b, 1, 1)
+    def forward(self, desc0: torch.Tensor, desc1: torch.Tensor):
+        """build assignment matrix from descriptors"""
+        mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
+        _, _, d = mdesc0.shape
+        mdesc0, mdesc1 = mdesc0 / d**0.25, mdesc1 / d**0.25
+        sim = torch.einsum("bmd,bnd->bmn", mdesc0, mdesc1)
+        z0 = self.matchability(desc0)
+        z1 = self.matchability(desc1)
+        scores, oa, ob = sigmoid_log_double_softmax(sim, z0, z1)
+        return scores, sim, oa, ob
 
-    couplings = torch.cat([torch.cat([scores, bins0], -1),
-                           torch.cat([bins1, alpha], -1)], 1)
+    def get_matchability(self, desc: torch.Tensor):
+        return torch.sigmoid(self.matchability(desc)).squeeze(-1)
 
-    norm = - (ms + ns).log()
-    log_mu = torch.cat([norm.expand(m), ns.log()[None] + norm])
-    log_nu = torch.cat([norm.expand(n), ms.log()[None] + norm])
-    log_mu, log_nu = log_mu[None].expand(b, -1), log_nu[None].expand(b, -1)
-
-    Z = log_sinkhorn_iterations(couplings, log_mu, log_nu, iters)
-    Z = Z - norm  # multiply probabilities by M+N
-    return Z
-
+def filter_matches(scores: torch.Tensor, th: float):
+    """obtain matches from a log assignment matrix [Bx M+1 x N+1]"""
+    max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
+    m0, m1 = max0.indices, max1.indices
+    indices0 = torch.arange(m0.shape[1], device=m0.device)[None]
+    indices1 = torch.arange(m1.shape[1], device=m1.device)[None]
+    mutual0 = indices0 == m1.gather(1, m0)
+    mutual1 = indices1 == m0.gather(1, m1)
+    max0_exp = max0.values.exp()
+    zero = max0_exp.new_tensor(0)
+    mscores0 = torch.where(mutual0, max0_exp, zero)
+    mscores1 = torch.where(mutual1, mscores0.gather(1, m1), zero)
+    valid0 = mutual0 & (mscores0 > th)
+    valid1 = mutual1 & valid0.gather(1, m1)
+    m0 = torch.where(valid0, m0, -1)
+    m1 = torch.where(valid1, m1, -1)
+    return m0, m1, mscores0, mscores1
 
 def arange_like(x, dim: int):
     return x.new_ones(x.shape[dim]).cumsum(0) - 1  # traceable in 1.1
@@ -213,6 +237,8 @@ class SuperGlue(nn.Module):
 
         self.gnn = AttentionalGNN(
             self.config['descriptor_dim'], self.config['GNN_layers'])
+        
+        self.log_assignment = MatchAssignment(self.config['descriptor_dim'])
 
         self.final_proj = nn.Conv1d(
             self.config['descriptor_dim'], self.config['descriptor_dim'],
@@ -230,8 +256,8 @@ class SuperGlue(nn.Module):
 
     def forward(self, data):
         """Run SuperGlue on a pair of keypoints and descriptors"""
-        desc0, desc1 = data['descriptors0'].double(), data['descriptors1'].double()
-        kpts0, kpts1 = data['keypoints0'].double(), data['keypoints1'].double()
+        desc0, desc1 = data['desc_image'].double(), data['desc_depth'].double()
+        kpts0, kpts1 = data['keypoints_rgb'].double(), data['keypoints_depth'].double()
 
         desc0 = desc0.transpose(0,1)
         desc1 = desc1.transpose(0,1)
@@ -262,50 +288,65 @@ class SuperGlue(nn.Module):
         # Multi-layer Transformer network.
         desc0, desc1 = self.gnn(desc0, desc1)
 
-        # Final MLP projection.
-        mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
+        match_list = []
+        sim_list = []
+        scores0 = []
+        scores1 = []
 
-        # Compute matching descriptor distance.
-        scores = torch.einsum('bdn,bdm->bnm', mdesc0, mdesc1)
-        scores = scores / self.config['descriptor_dim']**.5
+        for i in range(desc0.shape[0]):
+            scores, sim, oa, ob = self.log_assignment(desc0[i].transpose(1, 0).unsqueeze(0), desc1[i].transpose(1, 0).unsqueeze(0))  
+            # scores0.append(self.log_assignment.get_matchability(l0_points[i].unsqueeze(0).permute(0, 2, 1)))
+            # scores1.append(self.log_assignment.get_matchability(des2d[i].permute(0, 2, 1)))
+            scores0.append(oa)
+            scores1.append(ob)
+            
+            m0, m1, mscores0, mscores1 = filter_matches(scores, 0.0)
+            valid = m0[0] > -1
+            m_indices_0 = torch.where(valid)[0]
+            m_indices_1 = m0[0][valid]
+            match_list.append(torch.stack([m_indices_0, m_indices_1], -1))
+            sim_list.append(scores.squeeze(0))  # Use this while training
+            # sim_list.append(torch.exp(scores.squeeze(0)[m_indices_0, m_indices_1]))
+        return  match_list, sim_list, scores0, scores1
+        # return  kp2d, kp3d, matches, sim_list, fov_score, score0, score1
 
-        # Run the optimal transport.
-        scores = log_optimal_transport(
-            scores, self.bin_score,
-            iters=self.config['sinkhorn_iterations'])
 
-        # Get the matches with score above "match_threshold".
-        max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
-        indices0, indices1 = max0.indices, max1.indices
-        mutual0 = arange_like(indices0, 1)[None] == indices1.gather(1, indices0)
-        mutual1 = arange_like(indices1, 1)[None] == indices0.gather(1, indices1)
-        zero = scores.new_tensor(0)
-        mscores0 = torch.where(mutual0, max0.values.exp(), zero)
-        mscores1 = torch.where(mutual1, mscores0.gather(1, indices1), zero)
-        valid0 = mutual0 & (mscores0 > self.config['match_threshold'])
-        valid1 = mutual1 & valid0.gather(1, indices1)
-        indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
-        indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
 
-        # check if indexed correctly
-        loss = []
-        for i in range(len(all_matches[0])):
-            x = all_matches[0][i][0]
-            y = all_matches[0][i][1]
-            loss.append(-torch.log( scores[0][x][y].exp() )) # check batch size == 1 ?
-        # for p0 in unmatched0:
-        #     loss += -torch.log(scores[0][p0][-1])
-        # for p1 in unmatched1:
-        #     loss += -torch.log(scores[0][-1][p1])
-        loss_mean = torch.mean(torch.stack(loss))
-        loss_mean = torch.reshape(loss_mean, (1, -1))
-        return {
-            'matches0': indices0[0], # use -1 for invalid match
-            'matches1': indices1[0], # use -1 for invalid match
-            'matching_scores0': mscores0[0],
-            'matching_scores1': mscores1[0],
-            'loss': loss_mean[0],
-            'skip_train': False
-        }
 
-        # scores big value or small value means confidence? log can't take neg value
+
+
+
+
+        # # Final MLP projection.
+        # mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
+
+        # # Compute matching descriptor distance.
+        # scores = torch.einsum('bdn,bdm->bnm', mdesc0, mdesc1)
+        # scores = scores / self.config['descriptor_dim']**.5
+
+        # # Run the optimal transport.
+        # scores = log_optimal_transport(
+        #     scores, self.bin_score,
+        #     iters=self.config['sinkhorn_iterations'])
+
+        # # Get the matches with score above "match_threshold".
+        # max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
+        # indices0, indices1 = max0.indices, max1.indices
+        # mutual0 = arange_like(indices0, 1)[None] == indices1.gather(1, indices0)
+        # mutual1 = arange_like(indices1, 1)[None] == indices0.gather(1, indices1)
+        # zero = scores.new_tensor(0)
+        # mscores0 = torch.where(mutual0, max0.values.exp(), zero)
+        # mscores1 = torch.where(mutual1, mscores0.gather(1, indices1), zero)
+        # valid0 = mutual0 & (mscores0 > self.config['match_threshold'])
+        # valid1 = mutual1 & valid0.gather(1, indices1)
+        # indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
+        # indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
+
+        # return {
+        #     'matches0': indices0[0], # use -1 for invalid match
+        #     'matches1': indices1[0], # use -1 for invalid match
+        #     'matching_scores0': mscores0[0],
+        #     'matching_scores1': mscores1[0],
+        #     'skip_train': False
+        # }
+        # # scores big value or small value means confidence? log can't take neg value

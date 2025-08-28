@@ -42,6 +42,7 @@
 
 from pathlib import Path
 import torch
+from kornia.color import rgb_to_grayscale
 from torch import nn
 
 def simple_nms(scores, nms_radius: int):
@@ -145,7 +146,10 @@ class SuperPoint(nn.Module):
     def forward(self, data):
         """ Compute keypoints, scores, descriptors for image """
         # Shared Encoder
-        x = self.relu(self.conv1a(data['image']))
+        image = data["image"]
+        if image.shape[1] == 3:
+            image = rgb_to_grayscale(image)
+        x = self.relu(self.conv1a(image))
         x = self.relu(self.conv1b(x))
         x = self.pool(x)
         x = self.relu(self.conv2a(x))

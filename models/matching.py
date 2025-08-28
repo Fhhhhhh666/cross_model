@@ -3,7 +3,7 @@ import torch.nn as nn
 from models.superpoint import SuperPoint
 from models.superglue import SuperGlue
 
-class RangeImageMatcher(nn.Module):
+class image_depth_Matcher(nn.Module):
     def __init__(self, config={}):
         super().__init__()
         # 初始化SuperPoint模型
