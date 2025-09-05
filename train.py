@@ -22,13 +22,13 @@ parser = argparse.ArgumentParser(
     description='DepthImage and RGBImage matching ',
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
-parser.add_argument('--epoch', type=int, default=1000, help='Number of epochs to train')
-parser.add_argument('--learning_rate', type=float, default=1e-3, help='Learning rate')
+parser.add_argument('--epoch', type=int, default=200, help='Number of epochs to train')
+parser.add_argument('--learning_rate', type=float, default=0.0001, help='Learning rate')
 
 parser.add_argument(
     '--nms_radius', type=int, default=4,
     help='SuperPoint Non Maximum Suppression (NMS) radius'
-    ' (Must be positive)')
+' (Must be positive)')
 parser.add_argument(
     '--keypoint_threshold', type=float, default=0.005,
     help='SuperPoint keypoint detector confidence threshold')
@@ -55,16 +55,24 @@ def des_loss_org(sxy_points, kp2d, sim_list, scores0, scores1, th1=3, th2=3):
     loss1 = 0
     loss2 = 0
     BCELoss = torch.nn.BCELoss()
-
+    scores0 = torch.cat(scores0, dim=0)
+    scores1 = torch.cat(scores1, dim=0)
+    # print("sxy_points:", sxy_points.shape)
+    # print("kp2d:", kp2d.shape)
+    # print("scores0:", scores0.shape)
+    # print("scores1:", scores1.shape)
+    # print(sim_list[0].shape)
     for i in range(kp2d.shape[0]):
-        p1 = sxy_points[i].clone().to('cpu')
-        p2 = kp2d[i].clone().to('cpu').to(torch.float32)
-        sc0 = torch.exp(scores0[i]).squeeze(0).to('cpu')
-        sc1 = torch.exp(scores1[i]).squeeze(0).to('cpu')
+        p2 = sxy_points[i].clone().to('cpu')
+        p1 = kp2d[i].clone().to('cpu').to(torch.float32)
+        sc0 = torch.exp(scores0[i]).to('cpu')
+        sc1 = torch.exp(scores1[i]).to('cpu')
         score_tensor0 = torch.zeros(sc0.shape)
         score_tensor1 = torch.zeros(sc1.shape)
         zero_indices = (p1[:, 0] == 0) & (p1[:, 1] == 0)
         zero_indices = zero_indices.nonzero().squeeze(1)
+
+        print(p1.shape, p2.shape, sc0.shape, sc1.shape)
 
         distances = torch.cdist(p1.unsqueeze(0), p2.unsqueeze(0)).squeeze(0)
 
@@ -79,8 +87,13 @@ def des_loss_org(sxy_points, kp2d, sim_list, scores0, scores1, th1=3, th2=3):
         des_pairs1 = sim_list[i][pairs_indices1, min_index1[pairs_indices1]]
         # des_pairs2 = sim_list[i][min_index2[pairs_indices2], pairs_indices2]
 
+        # score_tensor0[pairs_indices1[:, 0]] = 1
+        # valid_indices2 = pairs_indices2[:, 0] < score_tensor1.shape[0]
+        # score_tensor1[pairs_indices2[:, 0][valid_indices2]] = 1
+
         score_tensor0[pairs_indices1[:, 0]] = 1
         score_tensor1[pairs_indices2[:, 0]] = 1
+
         sc0loss = BCELoss(sc0, score_tensor0)
         sc1loss = BCELoss(sc1, score_tensor1)
         # des_no_pairs1 = sim_list[i][no_pairs_indices1, :].squeeze(-1)
@@ -111,9 +124,8 @@ if __name__ == '__main__':
     print(opt)
 
     # load training data
-    train_set = image_depth_Dataset(opt.dataset_root, opt.name, opt.image_size, opt.camera_intrinsics, opt.depth_scale)
+    train_set = image_depth_Dataset(config,opt.dataset_root, opt.name, opt.image_size, opt.camera_intrinsics, opt.depth_scale)
     train_loader = torch.utils.data.DataLoader(dataset=train_set, shuffle=False, batch_size=opt.batch_size, drop_last=True)
-
     superglue = SuperGlue(config.get('superglue', {}))
 
     if torch.cuda.is_available():
@@ -121,7 +133,7 @@ if __name__ == '__main__':
     else:
         print("### CUDA not available ###")
     optimizer = torch.optim.Adam(superglue.parameters(), lr=opt.learning_rate)
-    superglue.double().train()
+    superglue.train()
     loss_epoch_avg = []
     for epoch in range(1,opt.epoch+1):
         start_time = time.time()
@@ -131,19 +143,35 @@ if __name__ == '__main__':
         for i, batch in enumerate(tqdm(train_loader)):
             batch_start_time = time.time()
             for k in batch:
-                if k == 'keypoints_rgb' or k == 'keypoints_depth' or k== 'desc_image' or 'desc_depth' or k=='xy_points':
+                if k == 'keypoints_rgb' or k == 'keypoints_depth' or k== 'desc_image' or 'desc_depth' or k=='xy_points' or k == 'scores_rgb' or k == 'scores_depth':
                     if type(batch[k]) == torch.Tensor:
                         batch[k] = Variable(batch[k].cuda())
-                    else:
+                    elif isinstance(batch[k], list) and isinstance(batch[k][0], torch.Tensor):
                         batch[k] = Variable(torch.stack(batch[k]).cuda())
-                              
+
+            # print('image:',batch['image'].shape)
+            # print('depth:',batch['depth'].shape)
+            # print('keypoints_rgb:',batch['keypoints_rgb'].shape)
+            # print('keypoints_depth:',batch['keypoints_depth'].shape)
+            # print('desc_image:',batch['desc_image'].shape)
+            # print('desc_depth:',batch['desc_depth'].shape)
+            # print('scores_rgb:',batch['scores_rgb'].shape)
+            # print('scores_depth:',batch['scores_depth'].shape)
+            # print("desc0", torch.isnan(batch['desc_image']).sum(), batch['desc_image'].shape)
+            # print("desc1", torch.isnan(batch['desc_depth']).sum(), batch['desc_depth'].shape)
+            # print("kpts0", torch.isnan(batch['keypoints_rgb']).sum(), batch['keypoints_rgb'].shape)
+            # print("kpts1", torch.isnan(batch['keypoints_depth']).sum(),batch['keypoints_depth'].shape)
+            # print("scores_rgb", torch.isnan(batch['scores_rgb']).sum(), batch['scores_rgb'].shape)
+            # print("scores_depth", torch.isnan(batch['scores_depth']).sum(), batch['scores_depth'].shape)
+            # print("depth", torch.isnan(batch['depth']).sum(), batch['depth'].shape)
+            # print("sxy_points", torch.isnan(batch['xy_points']).sum(), batch['xy_points'].shape)
+            # print("kpts_depth_pointclouds", torch.isnan(batch['kpts_depth_pointclouds']).sum(), batch['kpts_depth_pointclouds'].shape)
+
+            optimizer.zero_grad()
             matches, sim_list, score0, score1 = superglue(batch)
             loss1, loss2 = des_loss_org(batch['xy_points'], batch['keypoints_rgb'], sim_list, score0, score1)
             loss = loss1 + loss2
-
             print(loss) 
-
-            loss.requires_grad_(True)
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
@@ -153,5 +181,6 @@ if __name__ == '__main__':
         end_time = time.time()
         epoch_duration = end_time - start_time
         print(f'Epoch [{epoch}/{opt.epoch}] Total Time: {epoch_duration:.4f} seconds')
-        torch.save(superglue.state_dict(), opt.checkpoint_dir + f"Encoder_epoch_{epoch}.t7")
+        if epoch % 50 == 0:
+            torch.save(superglue.state_dict(), opt.checkpoint_dir + f"Encoder_epoch_{epoch}.t7")
         loss_epoch_avg += [sum(loss_epoch) / len(loss_epoch)]

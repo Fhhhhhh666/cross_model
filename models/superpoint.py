@@ -112,7 +112,6 @@ class SuperPoint(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = {**self.default_config, **config}
-
         self.relu = nn.ReLU(inplace=True)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
         c1, c2, c3, c4, c5 = 64, 64, 128, 128, 256
@@ -134,7 +133,7 @@ class SuperPoint(nn.Module):
             c5, self.config['descriptor_dim'],
             kernel_size=1, stride=1, padding=0)
 
-        path = Path(__file__).parent / 'weights/superpoint_v1.pth'
+        path = Path(__file__).parent / '../weights/superpoint_v1.pth'
         self.load_state_dict(torch.load(str(path)))
 
         mk = self.config['max_keypoints']

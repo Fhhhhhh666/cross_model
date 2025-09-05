@@ -18,16 +18,16 @@ class image_depth_Dataset(Dataset):
         camera_intrinsics (np.array): 3x3 camera intrinsic matrix.
         depth_scale (float): Scale factor for depth values (default: 1000.0).
     """
-    def __init__(self, data_root, name,image_size,camera_intrinsics = [[585,0,320],[0,585,240],[0,0,1]], depth_scale=1000.0):
+    def __init__(self, config,data_root, name,image_size,camera_intrinsics = [[585,0,320],[0,585,240],[0,0,1]], depth_scale=1000.0):
         self.data_root = data_root
         self.dataset_name = name
         self.dataset_path = os.path.join(data_root, name)
         self.dataset_classes = os.listdir(self.dataset_path)
         self.image_size = image_size
-        self.camera_intrinsics = camera_intrinsics
+        self.camera_intrinsics = torch.tensor(camera_intrinsics, dtype=torch.float32)
         self.depth_scale = depth_scale
         self.data = self.load_data()
-        self.superpoint = superpoint.SuperPoint()
+        self.superpoint = superpoint.SuperPoint(config.get('superpoint', {}))
     
 
     def __len__(self):
@@ -47,9 +47,24 @@ class image_depth_Dataset(Dataset):
         pred_depth = self.superpoint({'image':normailzed_depth[None]})
 
         kpts_rgb = pred_rgb['keypoints'][0]
-        kpts_depth = pred_depth['keypoints'][0]
+        scores_rgb = pred_rgb['scores'][0]
         desc_rgb = pred_rgb['descriptors'][0]
+
+        kpts_depth = pred_depth['keypoints'][0]
+        scores_depth = pred_depth['scores'][0]
         desc_depth = pred_depth['descriptors'][0]
+
+        # 筛选 kpts_depth 对应的深度图为 0 的点
+        u = torch.round(kpts_depth[:, 0]).long()
+        v = torch.round(kpts_depth[:, 1]).long()
+        valid_mask = (u >= 0) & (u < depth.shape[2]) & (v >= 0) & (v < depth.shape[1])
+        depth_values = torch.zeros_like(u, dtype=depth.dtype)
+        depth_values[valid_mask] = depth[0, v[valid_mask], u[valid_mask]]
+        nonzero_mask = (depth_values > 0) & valid_mask
+
+        kpts_depth = kpts_depth[nonzero_mask]
+        scores_depth = scores_depth[nonzero_mask]
+        desc_depth = desc_depth[:, nonzero_mask]
 
         kpts_depth_pointclouds = self.depth_image_to_point_cloud(depth,kpts_depth, self.camera_intrinsics, camera_to_world_pose_matrix)
         _, xy_points = self.tr3d2d(kpts_depth_pointclouds, self.camera_intrinsics, world_to_camera_pose_matrix)
@@ -64,7 +79,10 @@ class image_depth_Dataset(Dataset):
             'xy_points': xy_points,           # 点云投影到图像平面的点 [N, 2]
             'desc_image': desc_rgb,           # RGB图像描述子 [D, M]
             'desc_depth': desc_depth,         # 深度图像描述子 [D, N]
+            'scores_rgb': scores_rgb,         # RGB图像特征点分数 [M]
+            'scores_depth': scores_depth,     # 深度图像特征点分数 [N]
             'image_path': image_file,         # 图像路径
+            'kpts_depth_pointclouds': kpts_depth_pointclouds, # 深度图特征点对应的点云坐标 [N_valid, 3]
             'depth_path': depth_file          # 深度图路径
         }
         
@@ -79,31 +97,15 @@ class image_depth_Dataset(Dataset):
                         pose_file = os.path.join(cls_path, file)
                         # 查找对应的图像和深度文件
                         base_name = file.replace('_pose.txt', '')
-                        image_file = os.path.join(cls_path, f"{base_name}_color.png")
-                        depth_file = os.path.join(cls_path, f"{base_name}_depth.png")
-                        
-                        if os.path.exists(image_file) and os.path.exists(depth_file):
-                            data.append((pose_file, image_file, depth_file))
+                        image_file = os.path.join(cls_path, f"{base_name}.color.png")
+                        depth_file = os.path.join(cls_path, f"{base_name}.depth.png")
+                        data.append((pose_file, image_file, depth_file))
         return data
     
     def load_pose(self, pose_file):
         """加载并解析位姿文件为4x4变换矩阵  camera-to-world"""
-        with open(pose_file, 'r') as f:
-            # 假设文件包含7个数值: tx, ty, tz, qx, qy, qz, qw
-            data = np.loadtxt(f)
-            
-        translation = data[:3]
-        quaternion = data[3:]  # 顺序: qx, qy, qz, qw
-        
-        # 创建旋转矩阵
-        rotation = R.from_quat(quaternion)
-        rotation_matrix = rotation.as_matrix()
-        
-        # 构建4x4变换矩阵
-        pose_matrix = np.eye(4)
-        pose_matrix[:3, :3] = rotation_matrix
-        pose_matrix[:3, 3] = translation
-        
+        pose_matrix = np.loadtxt(pose_file)  # 直接读取为4x4矩阵
+        assert pose_matrix.shape == (4, 4), "Pose matrix must be 4x4"
         return torch.from_numpy(pose_matrix).float()
 
     def load_image(self, image_file):
@@ -136,43 +138,42 @@ class image_depth_Dataset(Dataset):
     
         # 添加通道维度并转换单位（毫米→米）
         depth_tensor = depth_tensor.unsqueeze(0) / self.depth_scale
-    
-        # 处理无效深度值（0→NaN）[3](@ref)
-        depth_tensor[depth_tensor == 0] = float('nan')
-    
+        
         return depth_tensor
     
-    def normalized_depth(self,depth):
-        depth_min = torch.nanmin(depth)
-        depth_max = torch.nanmax(depth)
+    def normalized_depth(self, depth):
+        valid_mask = ~torch.isnan(depth)
+        depth_min = torch.min(depth[valid_mask])
+        depth_max = torch.max(depth[valid_mask])
         normalized_depth = (depth - depth_min) / (depth_max - depth_min)
         return normalized_depth
   
-    def tr3d2d(self,pointclouds, inter_matrix, transform_matrix, T, H = 480, W = 640):
-        pointclouds = torch.cat(
-                    (pointclouds, torch.ones(pointclouds.size(0), pointclouds.size(1), 1).to(pointclouds.device)),
-                    dim=2)
-        inter_matrix = inter_matrix[:, :, :3]  
-        transform_matrix = torch.bmm(transform_matrix.float(), T.float())
-        points = torch.matmul(pointclouds.to('cpu').float(), transform_matrix.transpose(1, 2))
-        points = torch.matmul(points, inter_matrix.transpose(1, 2))
-        z_coords = points[:, :, 2:3]
-        
-        positive_mask = (points >= 0).all(dim=2)
-        positive_mask_z = (z_coords >= 0).all(dim=2)    
-
-        points[~positive_mask] = 0
-        z_coords[~positive_mask_z] = 0
-        points = points / z_coords
-        xy_points = points[:, :, :2]
-
-        xy_points = self.replace_nan_values(xy_points)
-        fov_mask = (xy_points[:, :, 0] <= W) & (xy_points[:, :, 1] <= H)
-        xy_points[~fov_mask] = 0
-        heatmap = self.proj(xy_points, pointclouds.size(0), H, W)
+    def tr3d2d(self, pointclouds, inter_matrix, transform_matrix, H=480, W=640):
+        # pointclouds: (N, 3)
+        # inter_matrix: (3, 3)
+        # transform_matrix: (4, 4)
+        # 转为齐次坐标
+        ones = torch.ones((pointclouds.shape[0], 1), device=pointclouds.device)
+        points_homo = torch.cat([pointclouds, ones], dim=1)  # (N, 4)
+        # 世界坐标 -> 相机坐标
+        points_cam = torch.matmul(torch.inverse(transform_matrix), points_homo.t()).t()  # (N, 4)
+        points_cam = points_cam[:, :3]
+        # 相机坐标 -> 像素坐标
+        xy = torch.matmul(inter_matrix, points_cam.t()).t()  # (N, 3)
+        z = xy[:, 2]
+        # 防止除零
+        valid_mask = z > 0
+        xy_proj = torch.zeros_like(xy[:, :2])
+        xy_proj[valid_mask] = xy[valid_mask, :2] / z[valid_mask].unsqueeze(1)
+        # 清理无效值
+        xy_proj = self.replace_nan_values(xy_proj)
+        # 视野范围mask
+        fov_mask = (xy_proj[:, 0] >= 0) & (xy_proj[:, 0] < W) & (xy_proj[:, 1] >= 0) & (xy_proj[:, 1] < H)
+        xy_proj[~fov_mask] = 0
+        # 生成heatmap
+        heatmap = self.proj(xy_proj.unsqueeze(0), 1, H, W)  # batch_size=1
         heatmap = heatmap.permute(0, 3, 2, 1)
-
-        return heatmap, xy_points
+        return heatmap, xy_proj
     
     def proj(self,xy_points, batch_size, H, W):
         image_mask = torch.zeros(batch_size, W, H, 1)  
@@ -186,18 +187,19 @@ class image_depth_Dataset(Dataset):
                 image_mask[0, int(x), int(y), 0] = 1
         return image_mask
   
-    def replace_nan_values(self,point_set):
-        point_set.permute(0, 2, 1)
-        nan_mask = torch.isnan(point_set) 
-        cleaned_point_set = torch.where(nan_mask, torch.tensor([0.0, 0.0], device=point_set.device), point_set)
-        cleaned_point_set.permute(0, 2, 1)
+    def replace_nan_values(self, point_set):
+        # point_set: (N, 2)
+        nan_mask = torch.isnan(point_set)
+        cleaned_point_set = torch.where(nan_mask, torch.zeros_like(point_set), point_set)
         return cleaned_point_set
- 
+    
     def depth_image_to_point_cloud(self,depth,kpts_depth, K, pose):
         """ pose.txt: camera-to-world, 4*4 matrix in homogeneous coordinates
             K.txt: camera intrinsics(3*3 matrix
         """
-
+        # 处理无效深度值（0→NaN）[3](@ref)
+        depth[depth == 0] = float('nan')
+        
         # 确保深度图是二维张量
         if depth.dim() == 3:
             depth = depth.squeeze(0)
@@ -240,4 +242,28 @@ class image_depth_Dataset(Dataset):
         points = points_world[:, :3]  # 去除齐次坐标维度 (N_valid, 3)
         
         return points
+
+if __name__ == "__main__":
+    data_root = "./dataset"
+
+    sequence_range_train = range(10) 
+    data = image_depth_Dataset(data_root,'3dmatch',[640,480])
+    print(data)
+    print(data.data_root)
+    print(data.dataset_name)
+    print(data.dataset_path)
+    print(data.dataset_classes)
+    datas = []
+    for cls in data.dataset_classes:
+        cls_path = os.path.join(data.dataset_path, cls, 'query')
+        if os.path.isdir(cls_path):
+            for file in os.listdir(cls_path):
+                if '_pose.txt' in file:
+                    pose_file = os.path.join(cls_path, file)
+                    # 查找对应的图像和深度文件
+                    base_name = file.replace('_pose.txt', '')
+                    image_file = os.path.join(cls_path, f"{base_name}_color.png")
+                    depth_file = os.path.join(cls_path, f"{base_name}_depth.png")
+                    datas.append((pose_file, image_file, depth_file))
+    print(len(datas))    
 

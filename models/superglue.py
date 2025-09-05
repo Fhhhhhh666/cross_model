@@ -220,7 +220,7 @@ class SuperGlue(nn.Module):
 
     """
     default_config = {
-        'descriptor_dim': 128,
+        'descriptor_dim': 256,
         'weights': 'indoor',
         'keypoint_encoder': [32, 64, 128],
         'GNN_layers': ['self', 'cross'] * 9,
@@ -256,14 +256,9 @@ class SuperGlue(nn.Module):
 
     def forward(self, data):
         """Run SuperGlue on a pair of keypoints and descriptors"""
-        desc0, desc1 = data['desc_image'].double(), data['desc_depth'].double()
-        kpts0, kpts1 = data['keypoints_rgb'].double(), data['keypoints_depth'].double()
+        desc0, desc1 = data['desc_image'].float(), data['desc_depth'].float()
+        kpts0, kpts1 = data['keypoints_rgb'].float(), data['keypoints_depth'].float()
 
-        desc0 = desc0.transpose(0,1)
-        desc1 = desc1.transpose(0,1)
-        kpts0 = torch.reshape(kpts0, (1, -1, 2))
-        kpts1 = torch.reshape(kpts1, (1, -1, 2))
-    
         if kpts0.shape[1] == 0 or kpts1.shape[1] == 0:  # no keypoints
             shape0, shape1 = kpts0.shape[:-1], kpts1.shape[:-1]
             return {
@@ -274,16 +269,14 @@ class SuperGlue(nn.Module):
                 'skip_train': True
             }
 
-        file_name = data['file_name']
-        all_matches = data['all_matches'].permute(1,2,0) # shape=torch.Size([1, 87, 2])
         
         # Keypoint normalization.
-        kpts0 = normalize_keypoints(kpts0, data['image0'].shape)
-        kpts1 = normalize_keypoints(kpts1, data['image1'].shape)
+        kpts0 = normalize_keypoints(kpts0, data['image'].shape)
+        kpts1 = normalize_keypoints(kpts1, data['depth'].shape)
 
         # Keypoint MLP encoder.
-        desc0 = desc0 + self.kenc(kpts0, torch.transpose(data['scores0'], 0, 1))
-        desc1 = desc1 + self.kenc(kpts1, torch.transpose(data['scores1'], 0, 1))
+        desc0 = desc0 + self.kenc(kpts0, data['scores_rgb'])
+        desc1 = desc1 + self.kenc(kpts1, data['scores_depth'])
 
         # Multi-layer Transformer network.
         desc0, desc1 = self.gnn(desc0, desc1)
