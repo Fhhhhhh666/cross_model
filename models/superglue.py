@@ -221,11 +221,9 @@ class SuperGlue(nn.Module):
     """
     default_config = {
         'descriptor_dim': 256,
-        'weights': 'indoor',
+        'weights': 'outdoor',
         'keypoint_encoder': [32, 64, 128],
         'GNN_layers': ['self', 'cross'] * 9,
-        'sinkhorn_iterations': 100,
-        'match_threshold': 0.2,
     }
 
     def __init__(self, config):
@@ -243,20 +241,20 @@ class SuperGlue(nn.Module):
         self.final_proj = nn.Conv1d(
             self.config['descriptor_dim'], self.config['descriptor_dim'],
             kernel_size=1, bias=True)
-
+        self.pc_score_layer=nn.Sequential(nn.Conv1d(256,256,1,bias=False),
+                                          nn.BatchNorm1d(256),
+                                          nn.ReLU(),
+                                          nn.Conv1d(256,64,1,bias=False),
+                                          nn.BatchNorm1d(64),
+                                          nn.ReLU(),
+                                          nn.Conv1d(64,1,1,bias=False),
+                                          nn.Sigmoid())
         bin_score = torch.nn.Parameter(torch.tensor(1.))
         self.register_parameter('bin_score', bin_score)
 
-        # assert self.config['weights'] in ['indoor', 'outdoor']
-        # path = Path(__file__).parent
-        # path = path / 'weights/superglue_{}.pth'.format(self.config['weights'])
-        # self.load_state_dict(torch.load(path))
-        # print('Loaded SuperGlue model (\"{}\" weights)'.format(
-        #     self.config['weights']))
-
     def forward(self, data):
         """Run SuperGlue on a pair of keypoints and descriptors"""
-        desc0, desc1 = data['desc_image'].float(), data['desc_depth'].float()
+        desc0, desc1 = data['desc_rgb'].float(), data['desc_depth'].float()
         kpts0, kpts1 = data['keypoints_rgb'].float(), data['keypoints_depth'].float()
 
         if kpts0.shape[1] == 0 or kpts1.shape[1] == 0:  # no keypoints
@@ -281,6 +279,9 @@ class SuperGlue(nn.Module):
         # Multi-layer Transformer network.
         desc0, desc1 = self.gnn(desc0, desc1)
 
+
+        out = self.pc_score_layer(desc1).permute(0, 2, 1)
+
         match_list = []
         sim_list = []
         scores0 = []
@@ -288,58 +289,15 @@ class SuperGlue(nn.Module):
 
         for i in range(desc0.shape[0]):
             scores, sim, oa, ob = self.log_assignment(desc0[i].transpose(1, 0).unsqueeze(0), desc1[i].transpose(1, 0).unsqueeze(0))  
-            # scores0.append(self.log_assignment.get_matchability(l0_points[i].unsqueeze(0).permute(0, 2, 1)))
-            # scores1.append(self.log_assignment.get_matchability(des2d[i].permute(0, 2, 1)))
+           
             scores0.append(oa)
             scores1.append(ob)
             
-            m0, m1, mscores0, mscores1 = filter_matches(scores, 0.0)
+            m0, m1, mscores0, mscores1 = filter_matches(scores, 0.1)
             valid = m0[0] > -1
             m_indices_0 = torch.where(valid)[0]
             m_indices_1 = m0[0][valid]
             match_list.append(torch.stack([m_indices_0, m_indices_1], -1))
             sim_list.append(scores.squeeze(0))  # Use this while training
             # sim_list.append(torch.exp(scores.squeeze(0)[m_indices_0, m_indices_1]))
-        return  match_list, sim_list, scores0, scores1
-        # return  kp2d, kp3d, matches, sim_list, fov_score, score0, score1
-
-
-
-
-
-
-
-
-        # # Final MLP projection.
-        # mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
-
-        # # Compute matching descriptor distance.
-        # scores = torch.einsum('bdn,bdm->bnm', mdesc0, mdesc1)
-        # scores = scores / self.config['descriptor_dim']**.5
-
-        # # Run the optimal transport.
-        # scores = log_optimal_transport(
-        #     scores, self.bin_score,
-        #     iters=self.config['sinkhorn_iterations'])
-
-        # # Get the matches with score above "match_threshold".
-        # max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
-        # indices0, indices1 = max0.indices, max1.indices
-        # mutual0 = arange_like(indices0, 1)[None] == indices1.gather(1, indices0)
-        # mutual1 = arange_like(indices1, 1)[None] == indices0.gather(1, indices1)
-        # zero = scores.new_tensor(0)
-        # mscores0 = torch.where(mutual0, max0.values.exp(), zero)
-        # mscores1 = torch.where(mutual1, mscores0.gather(1, indices1), zero)
-        # valid0 = mutual0 & (mscores0 > self.config['match_threshold'])
-        # valid1 = mutual1 & valid0.gather(1, indices1)
-        # indices0 = torch.where(valid0, indices0, indices0.new_tensor(-1))
-        # indices1 = torch.where(valid1, indices1, indices1.new_tensor(-1))
-
-        # return {
-        #     'matches0': indices0[0], # use -1 for invalid match
-        #     'matches1': indices1[0], # use -1 for invalid match
-        #     'matching_scores0': mscores0[0],
-        #     'matching_scores1': mscores1[0],
-        #     'skip_train': False
-        # }
-        # # scores big value or small value means confidence? log can't take neg value
+        return  match_list, sim_list, out, scores0, scores1
